@@ -6,11 +6,11 @@ import java.util.List;
 import java.util.Timer;
 
 /**
- * TracksGame - FINAL
+ * TracksGame - FINAL (A* everywhere)
  *
- * Added:
- * 1) D&C Meet-in-the-Middle Solver (half-depth split + combine)
- * 2) Fallback to original Bidirectional A* if D&C doesn't finish
+ * All search phases use A* (priority queue with f = g + h):
+ * 1) D&C Meet-in-the-Middle: forward half via A*, backward half via A*, then combine
+ * 2) Fallback full Bidirectional A* if D&C doesn't finish
  *
  * Visual:
  * - Forward explored = Light Blue
@@ -28,7 +28,7 @@ public class TracksGame extends JFrame {
     enum GameMode { PATTERN1, PATTERN2, PATTERN3, PATTERN4, PATTERN5, RANDOM }
 
     public TracksGame() {
-        setTitle("Arbiter Logic: Serpentine Solver (D&C Meet-in-the-Middle + Bidirectional A*)");
+        setTitle("Arbiter Logic: Serpentine Solver (D&C Meet-in-the-Middle A* + Bidirectional A*)");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -390,9 +390,9 @@ public class TracksGame extends JFrame {
             BitSet visited;
             BState parent;
 
-            BState(Cell pos, int g, int f, int[] rowUsed, int[] colUsed, BitSet visited, BState parent) {
+            BState(Cell pos, int g, int f, int[] rowUsed, int[] bCol, BitSet visited, BState parent) {
                 this.pos = pos; this.g = g; this.f = f;
-                this.rowUsed = rowUsed; this.colUsed = colUsed;
+                this.rowUsed = rowUsed; this.colUsed = bCol;
                 this.visited = visited; this.parent = parent;
             }
         }
@@ -414,7 +414,7 @@ public class TracksGame extends JFrame {
         }
 
         // ==========================================================
-        // NEW: TRUE DIVIDE & CONQUER MEET-IN-THE-MIDDLE SOLVER
+        // DIVIDE & CONQUER MEET-IN-THE-MIDDLE SOLVER (A* in both halves)
         // ==========================================================
 
         private static class MidResult {
@@ -429,17 +429,17 @@ public class TracksGame extends JFrame {
         }
 
         /**
-         * D&C Solver:
-         * - Generates all forward partial states up to depth K
-         * - Generates all backward partial states up to depth (remaining-K)
-         * - Combines them by meeting cell
+         * D&C Solver using A* for both halves:
+         * - Forward A*: from currentHead toward endNode, up to depth K
+         * - Backward A*: from endNode toward currentHead, up to depth L = remaining - K
+         * - Combine states at meeting cells
          */
         private List<Cell> runDivideAndConquerMeetInMiddle(Cell forwardStart) {
 
             long startTime = System.currentTimeMillis();
-            long timeLimitMs = (gridSize <= 8) ? 4000 : 7000; // keep D&C quick
+            long timeLimitMs = (gridSize <= 8) ? 4000 : 7000;
 
-            // fixed path already placed (player/computer moves so far)
+            // Build already-placed path state
             BitSet fixed = new BitSet(gridSize * gridSize);
             int[] fRow0 = new int[gridSize];
             int[] fCol0 = new int[gridSize];
@@ -462,29 +462,29 @@ public class TracksGame extends JFrame {
             int remaining = totalNeeded - alreadyUsed;
             if (remaining < 0) return null;
 
-            // if remaining is small, A* is fine
+            // For small remainders, hand off directly to full Bidirectional A*
             if (remaining <= 6) return runBidirectionalAStar(forwardStart);
 
             int K = remaining / 2;
             int L = remaining - K;
 
-            // --- Forward half generation (depth K) ---
+            // --- Forward A* half (depth limit K, heuristic toward endNode) ---
             Map<Integer, ArrayList<FState>> forwardMap = new HashMap<>();
             HashSet<String> forwardSeen = new HashSet<>();
 
             FState fStart = new FState(
                     forwardStart,
                     0,
-                    0,
+                    manhattan(forwardStart, endNode),
                     Arrays.copyOf(fRow0, gridSize),
                     Arrays.copyOf(fCol0, gridSize),
                     (BitSet) fixed.clone(),
                     null
             );
 
-            generateForwardHalf(fStart, K, forwardMap, forwardSeen, fixed, startTime, timeLimitMs);
+            generateForwardHalfAStar(fStart, K, forwardMap, forwardSeen, fixed, startTime, timeLimitMs);
 
-            // --- Backward half generation (depth L) ---
+            // --- Backward A* half (depth limit L, heuristic toward forwardStart) ---
             Map<Integer, ArrayList<BState>> backwardMap = new HashMap<>();
             HashSet<String> backwardSeen = new HashSet<>();
 
@@ -499,28 +499,32 @@ public class TracksGame extends JFrame {
             BState bStart = new BState(
                     endNode,
                     0,
-                    0,
+                    manhattan(endNode, forwardStart),
                     bRow0,
                     bCol0,
                     bVis0,
                     null
             );
 
-            generateBackwardHalf(bStart, L, backwardMap, backwardSeen, fixed, startTime, timeLimitMs);
+            generateBackwardHalfAStar(bStart, L, backwardMap, backwardSeen, fixed, forwardStart, startTime, timeLimitMs);
 
-            // --- Combine ---
+            // --- Combine halves at meeting cells ---
             MidResult meet = combineHalves(forwardMap, backwardMap, forwardStart, remaining);
 
             if (meet == null) return null;
 
-            // For visual: mark meeting cell explored
             markExploredForward(meet.meetCell);
             markExploredBackward(meet.meetCell);
 
             return reconstructBidirectional(meet.fMeet, meet.bMeet, forwardStart);
         }
 
-        private void generateForwardHalf(
+        /**
+         * Forward A* half: explores states using f = g + h (h = manhattan to endNode).
+         * Stops expanding any state beyond depthLimit steps from the start.
+         * All states at any depth are stored in outMap for combination.
+         */
+        private void generateForwardHalfAStar(
                 FState start,
                 int depthLimit,
                 Map<Integer, ArrayList<FState>> outMap,
@@ -529,22 +533,22 @@ public class TracksGame extends JFrame {
                 long startTime,
                 long timeLimitMs
         ) {
-            ArrayDeque<FState> stack = new ArrayDeque<>();
-            stack.push(start);
+            // A* priority queue: lowest f first
+            PriorityQueue<FState> open = new PriorityQueue<>(Comparator.comparingInt(s -> s.f));
+            open.add(start);
 
-            while (!stack.isEmpty()) {
+            while (!open.isEmpty()) {
                 if (System.currentTimeMillis() - startTime > timeLimitMs) return;
 
-                FState cur = stack.pop();
+                FState cur = open.poll();
 
-                // store this state by cell
+                // Store every state (not just at depthLimit) for combination
                 int id = idx(cur.pos.r, cur.pos.c);
                 outMap.computeIfAbsent(id, k -> new ArrayList<>()).add(cur);
 
-                // stop at depthLimit
-                if (cur.g == depthLimit) continue;
+                // Don't expand beyond depth limit
+                if (cur.g >= depthLimit) continue;
 
-                // avoid explosion: prune duplicates
                 String k = keyState(id, cur.rowUsed, cur.colUsed);
                 if (!seen.add(k)) continue;
 
@@ -562,36 +566,49 @@ public class TracksGame extends JFrame {
                     if (nr[nxt.r] > rowClues[nxt.r]) continue;
                     if (nc[nxt.c] > colClues[nxt.c]) continue;
 
+                    String nk = keyState(nid, nr, nc);
+                    if (seen.contains(nk)) continue;
+
                     BitSet nVis = (BitSet) cur.visited.clone();
                     nVis.set(nid);
 
-                    FState ns = new FState(nxt, cur.g + 1, 0, nr, nc, nVis, cur);
-                    stack.push(ns);
+                    int ng = cur.g + 1;
+                    int nf = ng + manhattan(nxt, endNode); // A* heuristic toward endNode
+
+                    FState ns = new FState(nxt, ng, nf, nr, nc, nVis, cur);
+                    open.add(ns);
                 }
             }
         }
 
-        private void generateBackwardHalf(
+        /**
+         * Backward A* half: explores states using f = g + h (h = manhattan to forwardStart).
+         * Stops expanding any state beyond depthLimit steps from endNode.
+         * All states stored in outMap for combination.
+         */
+        private void generateBackwardHalfAStar(
                 BState start,
                 int depthLimit,
                 Map<Integer, ArrayList<BState>> outMap,
                 HashSet<String> seen,
                 BitSet fixed,
+                Cell forwardStart,
                 long startTime,
                 long timeLimitMs
         ) {
-            ArrayDeque<BState> stack = new ArrayDeque<>();
-            stack.push(start);
+            // A* priority queue: lowest f first
+            PriorityQueue<BState> open = new PriorityQueue<>(Comparator.comparingInt(s -> s.f));
+            open.add(start);
 
-            while (!stack.isEmpty()) {
+            while (!open.isEmpty()) {
                 if (System.currentTimeMillis() - startTime > timeLimitMs) return;
 
-                BState cur = stack.pop();
+                BState cur = open.poll();
 
                 int id = idx(cur.pos.r, cur.pos.c);
                 outMap.computeIfAbsent(id, k -> new ArrayList<>()).add(cur);
 
-                if (cur.g == depthLimit) continue;
+                if (cur.g >= depthLimit) continue;
 
                 String k = keyState(id, cur.rowUsed, cur.colUsed);
                 if (!seen.add(k)) continue;
@@ -602,7 +619,7 @@ public class TracksGame extends JFrame {
                     int nid = idx(nxt.r, nxt.c);
                     if (grid[nxt.r][nxt.c].isCrossed) continue;
 
-                    // Backward cannot step into fixed path (already placed from A side)
+                    // Backward cannot step on already-placed fixed path
                     if (fixed.get(nid)) continue;
 
                     if (cur.visited.get(nid)) continue;
@@ -614,11 +631,17 @@ public class TracksGame extends JFrame {
                     if (nr[nxt.r] > rowClues[nxt.r]) continue;
                     if (nc[nxt.c] > colClues[nxt.c]) continue;
 
+                    String nk = keyState(nid, nr, nc);
+                    if (seen.contains(nk)) continue;
+
                     BitSet nVis = (BitSet) cur.visited.clone();
                     nVis.set(nid);
 
-                    BState ns = new BState(nxt, cur.g + 1, 0, nr, nc, nVis, cur);
-                    stack.push(ns);
+                    int ng = cur.g + 1;
+                    int nf = ng + manhattan(nxt, forwardStart); // A* heuristic toward forwardStart
+
+                    BState ns = new BState(nxt, ng, nf, nr, nc, nVis, cur);
+                    open.add(ns);
                 }
             }
         }
@@ -629,28 +652,19 @@ public class TracksGame extends JFrame {
                 Cell forwardStart,
                 int remaining
         ) {
-            // Iterate through all possible meeting cells (intersection of keys)
             for (Map.Entry<Integer, ArrayList<FState>> e : fMap.entrySet()) {
                 int meetId = e.getKey();
                 ArrayList<BState> bList = bMap.get(meetId);
                 if (bList == null) continue;
 
                 ArrayList<FState> fList = e.getValue();
-
                 Cell meetCell = grid[meetId / gridSize][meetId % gridSize];
 
-                // Try all combinations of states at this meet cell
                 for (FState fs : fList) {
                     for (BState bs : bList) {
-
-                        // total depth must match remaining
                         if (fs.g + bs.g != remaining) continue;
-
                         if (!disjointExceptMeet(fs.visited, bs.visited, meetCell)) continue;
-
-                        if (!combineFeasible(fs.rowUsed, fs.colUsed, bs.rowUsed, bs.colUsed, meetCell))
-                            continue;
-
+                        if (!combineFeasible(fs.rowUsed, fs.colUsed, bs.rowUsed, bs.colUsed, meetCell)) continue;
                         return new MidResult(fs, bs, meetCell);
                     }
                 }
@@ -659,7 +673,7 @@ public class TracksGame extends JFrame {
         }
 
         // ==========================================================
-        // ORIGINAL BIDIRECTIONAL A* SOLVER (fallback)
+        // FULL BIDIRECTIONAL A* SOLVER (fallback)
         // ==========================================================
 
         private long getSmartTimeLimitMs() {
@@ -857,17 +871,22 @@ public class TracksGame extends JFrame {
         }
 
         // ==========================================================
-        // SOLVER ENTRY (uses D&C first, then fallback)
+        // SOLVER ENTRY (D&C A* first, then full Bidirectional A* fallback)
         // ==========================================================
 
         private List<Cell> findSolution() {
-
-            // 1) Try D&C meet-in-middle (true divide & conquer)
             List<Cell> dc = runDivideAndConquerMeetInMiddle(currentHead);
-            if (dc != null) return dc;
+            if (dc != null) {
+               System.out.println("Solved using D&C Meet-in-Middle A*");
+               return dc;
+            }
 
-            // 2) Fallback to original Bidirectional A*
-            return runBidirectionalAStar(currentHead);
+            System.out.println("Falling back to full Bidirectional A*");
+            List<Cell> astar = runBidirectionalAStar(currentHead);
+            if (astar != null)
+               System.out.println("Solved using Bidirectional A*");
+
+            return astar;
         }
 
         private void gracefulSolverExit(String title, String reason) {
@@ -913,7 +932,6 @@ public class TracksGame extends JFrame {
                     Cell originalParent = candidate.trackParent;
                     candidate.trackParent = currentHead;
 
-                    // Use D&C + fallback solver
                     if (runDivideAndConquerMeetInMiddle(candidate) != null || runBidirectionalAStar(candidate) != null) {
                         bestMove = candidate;
                         candidate.trackParent = originalParent;
@@ -929,9 +947,13 @@ public class TracksGame extends JFrame {
                         makeMove(move.r, move.c);
                         sidePanel.updateStatus("Computer → " + move);
                     } else {
-                        gracefulSolverExit("⚠ Solver Stuck",
-                                "Computer found no safe move that guarantees solvability.");
-                        return;
+                        if (!validMoves.isEmpty()) {
+                            makeMove(validMoves.get(0).r, validMoves.get(0).c);
+                            sidePanel.updateStatus("Computer → " + validMoves.get(0));
+                        } else {
+                            gracefulSolverExit("⚠ No Moves", "No valid moves remain.");
+                            return;
+                        }
                     }
                     repaint();
                     checkGameStatus();
@@ -1071,7 +1093,7 @@ public class TracksGame extends JFrame {
             Cell temp = currentHead;
             while (temp != null) { totalSteps++; temp = temp.trackParent; }
             String html = "<html><b>✓ Solution Verified!</b><br/>" +
-                    "<b>Algorithm:</b> D&C Meet-in-Middle + Bidirectional A* fallback<br/>" +
+                    "<b>Algorithm:</b> D&C A* Meet-in-Middle + Bidirectional A* fallback<br/>" +
                     "<b>Steps:</b> " + totalSteps + "<br/>" +
                     "<b>Coverage:</b> " + ((totalSteps * 100) / (gridSize * gridSize)) + "%</html>";
             sidePanel.updateAnalysis(html);
@@ -1252,4 +1274,4 @@ public class TracksGame extends JFrame {
         public void updateStatus(String msg) { statusLabel.setText(msg); }
         public void updateAnalysis(String html) { analysisLabel.setText(html); }
     }
-}  
+}
