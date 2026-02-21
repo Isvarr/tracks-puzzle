@@ -6,12 +6,15 @@ import java.util.List;
 import java.util.Timer;
 
 /**
- * TracksGame - FINAL (50-50 Bidirectional Solver + Visible Forward/Backward Search)
+ * TracksGame - FINAL
  *
- * NEW:
- * - Forward explored cells = Light Blue
- * - Backward explored cells = Light Pink
- * - Shows solver is truly bidirectional
+ * Added:
+ * 1) D&C Meet-in-the-Middle Solver (half-depth split + combine)
+ * 2) Fallback to original Bidirectional A* if D&C doesn't finish
+ *
+ * Visual:
+ * - Forward explored = Light Blue
+ * - Backward explored = Light Pink
  */
 public class TracksGame extends JFrame {
 
@@ -25,7 +28,7 @@ public class TracksGame extends JFrame {
     enum GameMode { PATTERN1, PATTERN2, PATTERN3, PATTERN4, PATTERN5, RANDOM }
 
     public TracksGame() {
-        setTitle("Arbiter Logic: Serpentine Solver (Bidirectional A* 50/50 + Visual Search)");
+        setTitle("Arbiter Logic: Serpentine Solver (D&C Meet-in-the-Middle + Bidirectional A*)");
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
@@ -69,7 +72,7 @@ public class TracksGame extends JFrame {
         private boolean computerThinking = false;
         private List<Cell> solutionPath = null;
 
-        // NEW: visual search highlight
+        // Visual search highlight
         private BitSet forwardExplored = null;
         private BitSet backwardExplored = null;
 
@@ -154,7 +157,6 @@ public class TracksGame extends JFrame {
             computerThinking = false;
             solutionPath = null;
 
-            // clear search highlights
             forwardExplored = new BitSet(gridSize * gridSize);
             backwardExplored = new BitSet(gridSize * gridSize);
 
@@ -320,13 +322,19 @@ public class TracksGame extends JFrame {
         }
 
         // ==========================================================
-        // 50/50 BIDIRECTIONAL A* + VISUAL HIGHLIGHT
+        // HELPERS
         // ==========================================================
 
         private int idx(int r, int c) { return r * gridSize + c; }
 
         private int manhattan(Cell a, Cell b) {
             return Math.abs(a.r - b.r) + Math.abs(a.c - b.c);
+        }
+
+        private int sumArray(int[] arr) {
+            int sum = 0;
+            for (int v : arr) sum += v;
+            return sum;
         }
 
         private String keyState(int cellId, int[] rowUsed, int[] colUsed) {
@@ -356,6 +364,10 @@ public class TracksGame extends JFrame {
             if (tmp.isEmpty()) return true;
             return tmp.cardinality() == 1 && tmp.get(meetIndex);
         }
+
+        // ==========================================================
+        // STATE CLASSES
+        // ==========================================================
 
         class FState {
             Cell pos;
@@ -400,6 +412,255 @@ public class TracksGame extends JFrame {
             if (!left.isEmpty() && left.get(0) == forwardStart) left.remove(0);
             return left;
         }
+
+        // ==========================================================
+        // NEW: TRUE DIVIDE & CONQUER MEET-IN-THE-MIDDLE SOLVER
+        // ==========================================================
+
+        private static class MidResult {
+            FState fMeet;
+            BState bMeet;
+            Cell meetCell;
+            MidResult(FState fMeet, BState bMeet, Cell meetCell) {
+                this.fMeet = fMeet;
+                this.bMeet = bMeet;
+                this.meetCell = meetCell;
+            }
+        }
+
+        /**
+         * D&C Solver:
+         * - Generates all forward partial states up to depth K
+         * - Generates all backward partial states up to depth (remaining-K)
+         * - Combines them by meeting cell
+         */
+        private List<Cell> runDivideAndConquerMeetInMiddle(Cell forwardStart) {
+
+            long startTime = System.currentTimeMillis();
+            long timeLimitMs = (gridSize <= 8) ? 4000 : 7000; // keep D&C quick
+
+            // fixed path already placed (player/computer moves so far)
+            BitSet fixed = new BitSet(gridSize * gridSize);
+            int[] fRow0 = new int[gridSize];
+            int[] fCol0 = new int[gridSize];
+
+            Cell t = forwardStart;
+            while (t != null) {
+                int id = idx(t.r, t.c);
+                if (!fixed.get(id)) {
+                    fixed.set(id);
+                    fRow0[t.r]++;
+                    fCol0[t.c]++;
+                }
+                t = t.trackParent;
+            }
+
+            int totalNeeded = sumArray(rowClues);
+            int alreadyUsed = 0;
+            for (int v : fRow0) alreadyUsed += v;
+
+            int remaining = totalNeeded - alreadyUsed;
+            if (remaining < 0) return null;
+
+            // if remaining is small, A* is fine
+            if (remaining <= 6) return runBidirectionalAStar(forwardStart);
+
+            int K = remaining / 2;
+            int L = remaining - K;
+
+            // --- Forward half generation (depth K) ---
+            Map<Integer, ArrayList<FState>> forwardMap = new HashMap<>();
+            HashSet<String> forwardSeen = new HashSet<>();
+
+            FState fStart = new FState(
+                    forwardStart,
+                    0,
+                    0,
+                    Arrays.copyOf(fRow0, gridSize),
+                    Arrays.copyOf(fCol0, gridSize),
+                    (BitSet) fixed.clone(),
+                    null
+            );
+
+            generateForwardHalf(fStart, K, forwardMap, forwardSeen, fixed, startTime, timeLimitMs);
+
+            // --- Backward half generation (depth L) ---
+            Map<Integer, ArrayList<BState>> backwardMap = new HashMap<>();
+            HashSet<String> backwardSeen = new HashSet<>();
+
+            BitSet bVis0 = new BitSet(gridSize * gridSize);
+            bVis0.set(idx(endNode.r, endNode.c));
+
+            int[] bRow0 = new int[gridSize];
+            int[] bCol0 = new int[gridSize];
+            bRow0[endNode.r] = 1;
+            bCol0[endNode.c] = 1;
+
+            BState bStart = new BState(
+                    endNode,
+                    0,
+                    0,
+                    bRow0,
+                    bCol0,
+                    bVis0,
+                    null
+            );
+
+            generateBackwardHalf(bStart, L, backwardMap, backwardSeen, fixed, startTime, timeLimitMs);
+
+            // --- Combine ---
+            MidResult meet = combineHalves(forwardMap, backwardMap, forwardStart, remaining);
+
+            if (meet == null) return null;
+
+            // For visual: mark meeting cell explored
+            markExploredForward(meet.meetCell);
+            markExploredBackward(meet.meetCell);
+
+            return reconstructBidirectional(meet.fMeet, meet.bMeet, forwardStart);
+        }
+
+        private void generateForwardHalf(
+                FState start,
+                int depthLimit,
+                Map<Integer, ArrayList<FState>> outMap,
+                HashSet<String> seen,
+                BitSet fixed,
+                long startTime,
+                long timeLimitMs
+        ) {
+            ArrayDeque<FState> stack = new ArrayDeque<>();
+            stack.push(start);
+
+            while (!stack.isEmpty()) {
+                if (System.currentTimeMillis() - startTime > timeLimitMs) return;
+
+                FState cur = stack.pop();
+
+                // store this state by cell
+                int id = idx(cur.pos.r, cur.pos.c);
+                outMap.computeIfAbsent(id, k -> new ArrayList<>()).add(cur);
+
+                // stop at depthLimit
+                if (cur.g == depthLimit) continue;
+
+                // avoid explosion: prune duplicates
+                String k = keyState(id, cur.rowUsed, cur.colUsed);
+                if (!seen.add(k)) continue;
+
+                markExploredForward(cur.pos);
+
+                for (Cell nxt : getNeighbors(cur.pos)) {
+                    int nid = idx(nxt.r, nxt.c);
+                    if (grid[nxt.r][nxt.c].isCrossed) continue;
+                    if (cur.visited.get(nid)) continue;
+
+                    int[] nr = Arrays.copyOf(cur.rowUsed, gridSize);
+                    int[] nc = Arrays.copyOf(cur.colUsed, gridSize);
+                    nr[nxt.r]++; nc[nxt.c]++;
+
+                    if (nr[nxt.r] > rowClues[nxt.r]) continue;
+                    if (nc[nxt.c] > colClues[nxt.c]) continue;
+
+                    BitSet nVis = (BitSet) cur.visited.clone();
+                    nVis.set(nid);
+
+                    FState ns = new FState(nxt, cur.g + 1, 0, nr, nc, nVis, cur);
+                    stack.push(ns);
+                }
+            }
+        }
+
+        private void generateBackwardHalf(
+                BState start,
+                int depthLimit,
+                Map<Integer, ArrayList<BState>> outMap,
+                HashSet<String> seen,
+                BitSet fixed,
+                long startTime,
+                long timeLimitMs
+        ) {
+            ArrayDeque<BState> stack = new ArrayDeque<>();
+            stack.push(start);
+
+            while (!stack.isEmpty()) {
+                if (System.currentTimeMillis() - startTime > timeLimitMs) return;
+
+                BState cur = stack.pop();
+
+                int id = idx(cur.pos.r, cur.pos.c);
+                outMap.computeIfAbsent(id, k -> new ArrayList<>()).add(cur);
+
+                if (cur.g == depthLimit) continue;
+
+                String k = keyState(id, cur.rowUsed, cur.colUsed);
+                if (!seen.add(k)) continue;
+
+                markExploredBackward(cur.pos);
+
+                for (Cell nxt : getNeighbors(cur.pos)) {
+                    int nid = idx(nxt.r, nxt.c);
+                    if (grid[nxt.r][nxt.c].isCrossed) continue;
+
+                    // Backward cannot step into fixed path (already placed from A side)
+                    if (fixed.get(nid)) continue;
+
+                    if (cur.visited.get(nid)) continue;
+
+                    int[] nr = Arrays.copyOf(cur.rowUsed, gridSize);
+                    int[] nc = Arrays.copyOf(cur.colUsed, gridSize);
+                    nr[nxt.r]++; nc[nxt.c]++;
+
+                    if (nr[nxt.r] > rowClues[nxt.r]) continue;
+                    if (nc[nxt.c] > colClues[nxt.c]) continue;
+
+                    BitSet nVis = (BitSet) cur.visited.clone();
+                    nVis.set(nid);
+
+                    BState ns = new BState(nxt, cur.g + 1, 0, nr, nc, nVis, cur);
+                    stack.push(ns);
+                }
+            }
+        }
+
+        private MidResult combineHalves(
+                Map<Integer, ArrayList<FState>> fMap,
+                Map<Integer, ArrayList<BState>> bMap,
+                Cell forwardStart,
+                int remaining
+        ) {
+            // Iterate through all possible meeting cells (intersection of keys)
+            for (Map.Entry<Integer, ArrayList<FState>> e : fMap.entrySet()) {
+                int meetId = e.getKey();
+                ArrayList<BState> bList = bMap.get(meetId);
+                if (bList == null) continue;
+
+                ArrayList<FState> fList = e.getValue();
+
+                Cell meetCell = grid[meetId / gridSize][meetId % gridSize];
+
+                // Try all combinations of states at this meet cell
+                for (FState fs : fList) {
+                    for (BState bs : bList) {
+
+                        // total depth must match remaining
+                        if (fs.g + bs.g != remaining) continue;
+
+                        if (!disjointExceptMeet(fs.visited, bs.visited, meetCell)) continue;
+
+                        if (!combineFeasible(fs.rowUsed, fs.colUsed, bs.rowUsed, bs.colUsed, meetCell))
+                            continue;
+
+                        return new MidResult(fs, bs, meetCell);
+                    }
+                }
+            }
+            return null;
+        }
+
+        // ==========================================================
+        // ORIGINAL BIDIRECTIONAL A* SOLVER (fallback)
+        // ==========================================================
 
         private long getSmartTimeLimitMs() {
             if (gridSize <= 8) return 7000;
@@ -490,7 +751,7 @@ public class TracksGame extends JFrame {
             int maxIterations = 600000;
             int it = 0;
 
-            boolean expandForward = false; // so first flip becomes forward
+            boolean expandForward = false;
 
             while (!fOpen.isEmpty() && !bOpen.isEmpty()) {
 
@@ -504,7 +765,6 @@ public class TracksGame extends JFrame {
                     if (cur == null) continue;
                     if (cur.g > remainingBudget) continue;
 
-                    // VISUAL
                     markExploredForward(cur.pos);
                     if (it % 1200 == 0) repaint();
 
@@ -550,7 +810,6 @@ public class TracksGame extends JFrame {
                     if (cur == null) continue;
                     if (cur.g > remainingBudget) continue;
 
-                    // VISUAL
                     markExploredBackward(cur.pos);
                     if (it % 1200 == 0) repaint();
 
@@ -597,7 +856,17 @@ public class TracksGame extends JFrame {
             return null;
         }
 
+        // ==========================================================
+        // SOLVER ENTRY (uses D&C first, then fallback)
+        // ==========================================================
+
         private List<Cell> findSolution() {
+
+            // 1) Try D&C meet-in-middle (true divide & conquer)
+            List<Cell> dc = runDivideAndConquerMeetInMiddle(currentHead);
+            if (dc != null) return dc;
+
+            // 2) Fallback to original Bidirectional A*
             return runBidirectionalAStar(currentHead);
         }
 
@@ -644,7 +913,8 @@ public class TracksGame extends JFrame {
                     Cell originalParent = candidate.trackParent;
                     candidate.trackParent = currentHead;
 
-                    if (runBidirectionalAStar(candidate) != null) {
+                    // Use D&C + fallback solver
+                    if (runDivideAndConquerMeetInMiddle(candidate) != null || runBidirectionalAStar(candidate) != null) {
                         bestMove = candidate;
                         candidate.trackParent = originalParent;
                         break;
@@ -693,7 +963,7 @@ public class TracksGame extends JFrame {
                     Cell originalParent = candidate.trackParent;
                     candidate.trackParent = currentHead;
 
-                    if (runBidirectionalAStar(candidate) != null) {
+                    if (runDivideAndConquerMeetInMiddle(candidate) != null || runBidirectionalAStar(candidate) != null) {
                         hintMove = candidate;
                         candidate.trackParent = originalParent;
                         break;
@@ -725,7 +995,6 @@ public class TracksGame extends JFrame {
             autoSolving = true;
             clearHints();
 
-            // reset highlights every solve
             forwardExplored.clear();
             backwardExplored.clear();
 
@@ -739,7 +1008,7 @@ public class TracksGame extends JFrame {
                         animateSolution(0);
                     } else {
                         gracefulSolverExit("⚠ Solver Timed Out",
-                                "Solver could not finish within the time limit (puzzle may still be solvable).");
+                                "Solver could not finish within the time limit.");
                     }
                 });
             }).start();
@@ -779,12 +1048,6 @@ public class TracksGame extends JFrame {
             return count;
         }
 
-        private int sumArray(int[] arr) {
-            int sum = 0;
-            for (int v : arr) sum += v;
-            return sum;
-        }
-
         private void checkGameStatus() {
             if (currentHead == endNode) {
                 gameOver = true;
@@ -807,13 +1070,10 @@ public class TracksGame extends JFrame {
             int totalSteps = 0;
             Cell temp = currentHead;
             while (temp != null) { totalSteps++; temp = temp.trackParent; }
-            String html = "<html><font color='black'>" +
-                        "<b>✓ Solution Verified!</b><br/>" +
-                        "<b>Algorithm:</b> Bidirectional A* (50/50) + MergeSort<br/>" +
-                        "<b>Steps:</b> " + totalSteps + "<br/>" +
-                        "<b>Coverage:</b> " + ((totalSteps * 100) / (gridSize * gridSize)) + "%" +
-                        "</font></html>"
-;
+            String html = "<html><b>✓ Solution Verified!</b><br/>" +
+                    "<b>Algorithm:</b> D&C Meet-in-Middle + Bidirectional A* fallback<br/>" +
+                    "<b>Steps:</b> " + totalSteps + "<br/>" +
+                    "<b>Coverage:</b> " + ((totalSteps * 100) / (gridSize * gridSize)) + "%</html>";
             sidePanel.updateAnalysis(html);
         }
 
@@ -845,14 +1105,13 @@ public class TracksGame extends JFrame {
                         g2.drawString(cCur + "/" + colClues[c], x + 12, startY - 10);
                     }
 
-                    // NEW: show explored cells
                     int id = idx(r, c);
                     if (forwardExplored != null && forwardExplored.get(id)) {
-                        g2.setColor(new Color(150, 200, 255, 120)); // light blue
+                        g2.setColor(new Color(150, 200, 255, 120));
                         g2.fillRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2);
                     }
                     if (backwardExplored != null && backwardExplored.get(id)) {
-                        g2.setColor(new Color(255, 170, 190, 120)); // light pink
+                        g2.setColor(new Color(255, 170, 190, 120));
                         g2.fillRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2);
                     }
 
@@ -916,7 +1175,7 @@ public class TracksGame extends JFrame {
             title.setForeground(new Color(40, 80, 160));
             title.setAlignmentX(CENTER_ALIGNMENT);
 
-            JLabel instr = new JLabel("<html><center><font color='black'><b>Controls:</b><br/>Left Click: Add Track<br/>Right Click: Mark X<br/><br/><b>Goal:</b> Connect A→B<br/>Match All Clues</font></center></html>");
+            JLabel instr = new JLabel("<html><center><b>Controls:</b><br/>Left Click: Add Track<br/>Right Click: Mark X<br/><br/><b>Goal:</b> Connect A→B<br/>Match All Clues</center></html>");
             instr.setAlignmentX(CENTER_ALIGNMENT);
             instr.setFont(new Font("SansSerif", Font.PLAIN, 12));
 
@@ -940,35 +1199,30 @@ public class TracksGame extends JFrame {
                 JButton patBtn = new JButton("Pattern " + i);
                 patBtn.setFont(new Font("SansSerif", Font.PLAIN, 11));
                 patBtn.addActionListener(e -> gamePanel.loadPattern(pattern));
-                patBtn.setForeground(Color.BLACK);
                 patternPanel.add(patBtn);
             }
 
             JButton randomBtn = new JButton("Random");
             randomBtn.setFont(new Font("SansSerif", Font.PLAIN, 11));
             randomBtn.addActionListener(e -> gamePanel.newRandomPuzzle());
-            randomBtn.setForeground(Color.BLACK);
             patternPanel.add(randomBtn);
 
             JButton hintBtn = new JButton("💡 Show Hint");
             hintBtn.setAlignmentX(CENTER_ALIGNMENT);
-            hintBtn.setMaximumSize(new Dimension(210, 38)); 
+            hintBtn.setMaximumSize(new Dimension(210, 38));
             hintBtn.setFont(new Font("SansSerif", Font.BOLD, 13));
-            hintBtn.setForeground(Color.BLACK);
             hintBtn.addActionListener(e -> gamePanel.showHint());
 
             JButton autoSolveBtn = new JButton("🤖 Auto-Solve");
             autoSolveBtn.setAlignmentX(CENTER_ALIGNMENT);
             autoSolveBtn.setMaximumSize(new Dimension(210, 38));
             autoSolveBtn.setFont(new Font("SansSerif", Font.BOLD, 13));
-            autoSolveBtn.setForeground(Color.BLACK);
             autoSolveBtn.addActionListener(e -> gamePanel.autoSolve());
 
             JButton resetBtn = new JButton("🔄 Reset");
             resetBtn.setAlignmentX(CENTER_ALIGNMENT);
             resetBtn.setMaximumSize(new Dimension(210, 38));
             resetBtn.setFont(new Font("SansSerif", Font.BOLD, 13));
-            resetBtn.setForeground(Color.BLACK);
             resetBtn.addActionListener(e -> gamePanel.resetCurrentPuzzle());
 
             add(title);
@@ -981,7 +1235,6 @@ public class TracksGame extends JFrame {
             JLabel patternLabel = new JLabel("Select Puzzle:");
             patternLabel.setAlignmentX(CENTER_ALIGNMENT);
             patternLabel.setFont(new Font("SansSerif", Font.BOLD, 14));
-            patternLabel.setForeground(Color.BLACK);
             add(patternLabel);
             add(Box.createRigidArea(new Dimension(0, 8)));
             add(patternPanel);
@@ -999,4 +1252,4 @@ public class TracksGame extends JFrame {
         public void updateStatus(String msg) { statusLabel.setText(msg); }
         public void updateAnalysis(String html) { analysisLabel.setText(html); }
     }
-}
+}  
